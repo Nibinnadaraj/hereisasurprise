@@ -994,77 +994,95 @@ const Piano = (() => {
     return 16 * b;  // loop length in seconds
   }
 
-  function loop() {
-    if (!playing) return;
+  // `gen` is bumped on every start()/stop() call. Any in-flight async
+  // resume() callback checks its own captured generation against the
+  // current one before acting — stale callbacks (from a start() that was
+  // immediately followed by other taps) become permanent no-ops. This is
+  // what guarantees only one loop can ever be scheduled, no matter how
+  // fast or in what order taps + the browser's resume() promise land.
+  let gen = 0;
+  let onChange = null; // external UI-sync hook
+
+  function loop(token) {
+    if (token !== gen || !playing) return;
     // 0.08 s buffer so notes are never scheduled in the past on slow-starting contexts
     const dur = playLoop(ctx.currentTime + 0.08);
-    loopTimer = setTimeout(loop, (dur - 0.85) * 1000);
+    loopTimer = setTimeout(() => loop(token), (dur - 0.85) * 1000);
   }
 
-  let starting = false; // re-entrance guard
-
   return {
+    isPlaying() { return playing; },
+    onChange(cb) { onChange = cb; },
+
     start() {
-      if (playing || starting) return;
-      starting = true;
-      if (!ctx) init();
-      // ctx.resume() always returns a Promise (resolves immediately if already running)
+      if (playing) return;        // already (intending to be) playing — no-op
+      playing = true;             // flips synchronously: UI can trust this immediately
+      gen++;
+      const myGen = gen;
+      if (!ctx) {
+        init();
+        ctx.onstatechange = () => { if (onChange) onChange(); };
+      }
       ctx.resume().then(() => {
-        starting = false;
-        if (!playing) { playing = true; loop(); }
-      }).catch(() => { starting = false; });
+        if (myGen === gen && playing) loop(myGen);
+      }).catch(() => {
+        if (myGen === gen) playing = false; // resume genuinely failed — reflect reality
+        if (onChange) onChange();
+      });
+      if (onChange) onChange();
     },
+
     stop() {
       if (!playing) return;
       playing = false;
+      gen++;                      // invalidates any pending resume().then() from start()
       clearTimeout(loopTimer);
       if (ctx) ctx.suspend();
+      if (onChange) onChange();
     },
+
     toggle() {
-      if (playing) { this.stop(); return false; }
-      else         { this.start(); return true; }
+      if (playing) this.stop(); else this.start();
+      return playing;             // already up to date — set synchronously above
     }
   };
 })();
 
 /* ─── MUSIC BUTTON & AUTO-START ───────────────────────────────── */
 const musicBtn = document.getElementById('music-btn');
-let audioUnlocked = false;
 
-function unlockAudio() {
-  if (audioUnlocked) return;
-  audioUnlocked = true;
-  Piano.start();
-  musicBtn.textContent = '🔇';
+function syncMusicBtn() {
+  musicBtn.textContent = Piano.isPlaying() ? '🔇' : '🎵';
 }
+Piano.onChange(syncMusicBtn);
 
-// Button: unlock on first press, toggle on subsequent presses
+// Button always toggles. Piano.start()/stop() are idempotent, so this is
+// safe to call even if auto-start already kicked in for this same tap.
 musicBtn.addEventListener('click', () => {
-  if (!audioUnlocked) {
-    unlockAudio();
-  } else {
-    const on = Piano.toggle();
-    musicBtn.textContent = on ? '🔇' : '🎹';
-  }
+  Piano.toggle();
+  syncMusicBtn();
 });
 
-// Auto-start on first interaction anywhere that isn't the music button.
-// Use touchstart so it fires immediately on mobile (no 300ms delay).
-// Remove both listeners once triggered so click never double-fires.
-function onFirstTouch(e) {
-  if (musicBtn.contains(e.target)) return; // button has its own handler
-  unlockAudio();
-  document.removeEventListener('touchstart', onFirstTouch);
-  document.removeEventListener('click',      onFirstClick);
+// Auto-start on first interaction anywhere on the page except the music
+// button itself (which has its own handler above — letting both fire for
+// the same tap would start-then-immediately-stop the music).
+function autoStart(e) {
+  if (Piano.isPlaying()) { detachAutoStart(); return; } // already on — just clean up
+  if (musicBtn.contains(e.target)) return;              // button handles its own taps
+  Piano.start();
+  syncMusicBtn();
+  detachAutoStart();
 }
-function onFirstClick(e) {
-  if (musicBtn.contains(e.target)) return;
-  unlockAudio();
-  document.removeEventListener('touchstart', onFirstTouch);
-  document.removeEventListener('click',      onFirstClick);
+function detachAutoStart() {
+  document.removeEventListener('touchstart', autoStart);
+  document.removeEventListener('mousedown',  autoStart);
+  document.removeEventListener('click',      autoStart);
+  document.removeEventListener('keydown',    autoStart);
 }
-document.addEventListener('touchstart', onFirstTouch, { passive: true });
-document.addEventListener('click',      onFirstClick);
+document.addEventListener('touchstart', autoStart, { passive: true });
+document.addEventListener('mousedown',  autoStart);
+document.addEventListener('click',      autoStart);
+document.addEventListener('keydown',    autoStart);
 </script>
 </body>
 </html>
